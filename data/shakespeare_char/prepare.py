@@ -15,12 +15,13 @@ def create_word_boundaries(encoded_data, byte_to_idx, idx_to_byte):
 
     # Create arrays for current and previous encoded bytes
     current_encoded = encoded_data
-    space_idx = byte_to_idx[' '.encode('utf-8')[0]]
+    space_idx = byte_to_idx[ord(' ')]
     prev_encoded = np.pad(encoded_data[:-1], (1, 0), constant_values=space_idx)
 
     # Function to check if a byte is the start of a UTF-8 character
     def is_start_of_char(byte_idx):
-        return (idx_to_byte[byte_idx] & 0xC0) != 0x80
+        byte = idx_to_byte[byte_idx]
+        return (byte < 128) or (192 <= byte <= 247)
 
     # Function to check if a byte is a space or punctuation
     def is_space_or_punct(byte_idx):
@@ -31,18 +32,27 @@ def create_word_boundaries(encoded_data, byte_to_idx, idx_to_byte):
     v_is_space_or_punct = np.vectorize(is_space_or_punct)
 
     # Identify start of UTF-8 characters
-    is_start_of_char = v_is_start_of_char(current_encoded)
+    start_of_char_flags = v_is_start_of_char(current_encoded)
 
     # Identify space or punctuation
-    is_space_or_punct = v_is_space_or_punct(current_encoded)
+    space_or_punct_flags = v_is_space_or_punct(current_encoded)
+
+    # Identify if previous byte is space or punctuation
+    prev_is_space_or_punct = v_is_space_or_punct(prev_encoded)
 
     # Identify word boundaries
-    is_word_boundary = is_start_of_char & (
-            is_space_or_punct |
-            v_is_space_or_punct(prev_encoded) |
-            (np.vectorize(lambda x: idx_to_byte[x] < 0x80)(prev_encoded))
+    is_word_boundary = start_of_char_flags & (
+            space_or_punct_flags | prev_is_space_or_punct
     )
 
+    # Debugging output
+    print("Encoded data:", encoded_data)
+    print("Current encoded:", current_encoded)
+    print("Previous encoded:", prev_encoded)
+    print("Start of char flags:", start_of_char_flags)
+    print("Space or punctuation flags:", space_or_punct_flags)
+    print("Previous is space or punctuation:", prev_is_space_or_punct)
+    print("Word boundaries:", is_word_boundary)
     return is_word_boundary.astype(np.uint8)
 
 
@@ -52,8 +62,7 @@ def main():
 
     with open(input_file_path, 'r') as f:
         data = f.read()
-    utf8_data = data.encode('utf-8')[:30]
-    print(f"length of dataset in characters: {len(data):,}")
+    utf8_data = data.encode('utf-8')[:40]
     print(f"length of UTF-8 dataset in characters: {len(utf8_data):,}")
 
     # get all the unique characters that occur in this text

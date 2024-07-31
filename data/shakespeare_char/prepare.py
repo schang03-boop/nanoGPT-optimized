@@ -6,63 +6,65 @@ encoder and decoder and some other related info.
 """
 import os
 import pickle
-import requests
 import numpy as np
 
-# download the tiny shakespeare dataset
-input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
-if not os.path.exists(input_file_path):
-    data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(input_file_path, 'w') as f:
-        f.write(requests.get(data_url).text)
 
-with open(input_file_path, 'r') as f:
-    data = f.read()
-print(f"length of dataset in characters: {len(data):,}")
+def main():
+    # download the tiny shakespeare dataset
+    input_file_path = os.path.join(os.path.dirname(__file__), 'enwik8.txt')
 
-# get all the unique characters that occur in this text
-chars = sorted(list(set(data)))
-vocab_size = len(chars)
-print("all the unique characters:", ''.join(chars))
-print(f"vocab size: {vocab_size:,}")
+    with open(input_file_path, 'r') as f:
+        data = f.read()
+    utf8_data = data.encode('utf-8')
+    print(f"length of UTF-8 dataset in characters: {len(utf8_data):,}")
 
-# create a mapping from characters to integers
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-def encode(s):
-    return [stoi[c] for c in s] # encoder: take a string, output a list of integers
-def decode(l):
-    return ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
+    # get all the unique characters that occur in this text
+    utf_bytes = sorted(list(set(utf8_data)))
+    utf8_vocab_size = len(utf_bytes)
+    print("all the unique bytes:", utf_bytes)
+    print(f"vocab size: {utf8_vocab_size:,}")
 
-# create the train and test splits
-n = len(data)
-train_data = data[:int(n*0.9)]
-val_data = data[int(n*0.9):]
+    # Create a mapping from bytes to integers
+    stoi = {ch: i for i, ch in enumerate(utf_bytes)}
+    itos = {i: ch for i, ch in enumerate(utf_bytes)}
 
-# encode both to integers
-train_ids = encode(train_data)
-val_ids = encode(val_data)
-print(f"train has {len(train_ids):,} tokens")
-print(f"val has {len(val_ids):,} tokens")
+    # create the train and test splits
+    n = len(utf8_data)
+    train_data = utf8_data[:int(n * 0.9)]
+    val_data = utf8_data[int(n * 0.9):int(n * 0.95)]
+    test_data = utf8_data[int(n * 0.95):]
 
-# export to bin files
-train_ids = np.array(train_ids, dtype=np.uint16)
-val_ids = np.array(val_ids, dtype=np.uint16)
-train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
-val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
+    # Encode both to integers
+    train_ids = [stoi[b] for b in train_data]
+    val_ids = [stoi[b] for b in val_data]
+    test_ids = [stoi[b] for b in test_data]
+    print(f"train has {len(train_ids):,} tokens")
+    print(f"val has {len(val_ids):,} tokens")
+    print(f"test has {len(test_ids):,} tokens")
 
-# save the meta information as well, to help us encode/decode later
-meta = {
-    'vocab_size': vocab_size,
-    'itos': itos,
-    'stoi': stoi,
-}
-with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
-    pickle.dump(meta, f)
+    # Export to bin files
+    train_ids = np.array(train_ids, dtype=np.uint16)
+    val_ids = np.array(val_ids, dtype=np.uint16)
+    test_ids = np.array(test_ids, dtype=np.uint16)
+    train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
+    val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
+    test_ids.tofile(os.path.join(os.path.dirname(__file__), 'test.bin'))
+    # Save the meta information as well, to help us encode/decode later
+    meta = {
+        'vocab_size': utf8_vocab_size,
+        'itos': itos,
+        'stoi': stoi,
+    }
+    with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
+        pickle.dump(meta, f)
 
-# length of dataset in characters:  1115394
+
+if __name__ == '__main__':
+    main()
+# length of dataset in UTF-8 bytes:  100M
 # all the unique characters:
-#  !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-# vocab size: 65
-# train has 1003854 tokens
-# val has 111540 tokens
+#  re-order into 0-204
+# vocab size: 205
+# train has 90M tokens
+# val has 5M tokens
+# test has 5M tokens

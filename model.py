@@ -121,6 +121,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    aux_task_weight: float = 0.1  # Initial weight for the auxiliary task loss
+    aux_task_decay: float = 1.5  # Decay rate for auxiliary task weight
+    max_iters: int = 600000  # Maximum number of iterations
 
 
 class GPT(nn.Module):
@@ -140,15 +143,18 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         """
-        : Innov 1, auxiliary task head for word boundary prediction
+        : Innov 1, auxiliary task head for word boundary prediction.
+        : Added aux weight, decay and word boundary head.
         """
         self.word_boundary_head = nn.Linear(config.n_embd, 2)  # 2 classes: word boundary or not
+        self.aux_task_weight = config.aux_task_weight
+        self.aux_task_decay = config.aux_task_decay
+        self.max_iters = config.max_iters
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
-
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -179,7 +185,11 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, word_boundaries=None):
+    def get_aux_weight(self, iter_num):
+        # Decay the auxiliary task weight over time
+        return self.aux_task_weight * math.exp(-self.aux_task_decay * iter_num / self.max_iters)
+
+    def forward(self, idx, targets=None, word_boundaries=None, iter_num=0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -195,8 +205,7 @@ class GPT(nn.Module):
 
         # Word boundary prediction logits
         wb_logits = self.word_boundary_head(x)
-
-        wb_bpb, combined_loss = None, None
+        wb_ce_loss, combined_loss = None, None
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -207,16 +216,17 @@ class GPT(nn.Module):
 
             # Auxiliary task loss (word boundary prediction)
             if word_boundaries is not None:
-                wb_ce_loss = F.cross_entropy(wb_logits.view(-1, 2), word_boundaries.view(-1), ignore_index=-1,
-                                             reduction='none')
-                wb_bpb = wb_ce_loss / log_e_2
-                combined_loss = loss + self.config.aux_task_weight * wb_bpb
+                wb_ce_loss = F.cross_entropy(wb_logits.view(-1, 2), word_boundaries.view(-1), ignore_index=-1)
+                aux_weight = self.get_aux_weight(iter_num)
+                combined_loss = loss + aux_weight * wb_ce_loss
+            else:
+                combined_loss = loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             lm_logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
 
-        return lm_logits, wb_logits, loss, wb_bpb, combined_loss
+        return lm_logits, wb_logits, loss, wb_ce_loss, combined_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

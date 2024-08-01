@@ -21,7 +21,7 @@ block_size = 256 # context of up to 256 previous characters
 # baby GPT model :)
 n_layer = 12
 n_head = 6
-n_embd = 384
+n_embd = 512
 dropout = 0.2
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
@@ -34,4 +34,4 @@ warmup_iters = 100 # not super necessary potentially
 
 # on macbook also add
 # device = 'mps'  # run on cpu only or use Mac GPU
-# compile = False # do not torch compile the model
+compile = False # do not torch compile the model

@@ -5,6 +5,9 @@ References:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+
+This model inherits from Nano-GPT model, which is a simplified version of GPT-2. Then added Adaptive
+Span to the model so that it can take longer context sequences.
 """
 
 import math
@@ -28,58 +31,6 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                                                                 dropout_p=self.dropout if self.training else 0,
-                                                                 is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -97,17 +48,105 @@ class MLP(nn.Module):
         return x
 
 
-class Block(nn.Module):
-
-    def __init__(self, config):
+class DynamicFractalAttentionHead(nn.Module):
+    def __init__(self, config, num_spans=4, head_size=None):
         super().__init__()
+        self.head_size = head_size if head_size is not None else config.n_embd
+        self.span_sizes = [2 ** (i+3) for i in range(num_spans)]  # [8, ..., 64]
+        self.sub_heads = nn.ModuleList([
+            nn.Linear(config.n_embd, self.head_size * 3, bias=False) for _ in self.span_sizes
+        ])
+        self.dynamic_weights = nn.Parameter(torch.ones(num_spans))
+        self.context_network = nn.Sequential(
+            nn.Linear(config.n_embd, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_spans)
+        )
+        self.proj = nn.Linear(self.head_size, self.head_size)
+        self.attn_dropout = nn.Dropout(config.dropout)
+
+        # Flash attention support
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+
+    def forward(self, x, mask=None):
+        B, T, _ = x.size()
+        context_scores = self.context_network(x.mean(dim=1))  # Use mean pooling for context
+        span_weights = F.softmax(self.dynamic_weights * context_scores, dim=-1)
+
+        outputs = []
+        for i, (sub_head, span_size) in enumerate(zip(self.sub_heads, self.span_sizes)):
+            qkv = sub_head(x).chunk(3, dim=-1)
+            q, k, v = map(lambda t: t.view(B, T, 1, self.head_size).transpose(1, 2), qkv)
+
+            if self.flash:
+                causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+                span_mask = torch.tril(torch.ones(T, T, device=x.device), diagonal=span_size - 1).bool()
+                attn_mask = causal_mask | ~span_mask
+                # Use Flash Attention
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask.unsqueeze(0).unsqueeze(0),
+                    dropout_p=self.attn_dropout.p if self.training else 0,
+                    is_causal=False  # We're using our own mask, so set this to False
+                )
+            else:
+                # Compute attention scores
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
+                # Create and apply the span-specific mask
+                span_mask = torch.tril(torch.ones(T, T, device=x.device), diagonal=span_size - 1)
+                att = att.masked_fill(span_mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                if mask is not None:
+                    att = att.masked_fill(mask == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v
+
+            y = y.transpose(1, 2).contiguous().view(B, T, self.head_size)
+            outputs.append(y * span_weights[:, i].unsqueeze(1).unsqueeze(2))
+
+        output = sum(outputs)
+        return self.proj(output)
+
+
+class DFASMultiHeadAttention(nn.Module):
+    def __init__(self, config, num_spans=4):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.head_size = config.n_embd // config.n_head
+        self.attention_heads = nn.ModuleList([
+            DynamicFractalAttentionHead(config, num_spans, self.head_size) for _ in range(config.n_head)
+        ])
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+    def forward(self, x, mask=None):
+        B, T, C = x.size()
+        outputs = []
+        for i, head in enumerate(self.attention_heads):
+            head_output = head(x, mask)
+            outputs.append(head_output)
+
+        y = torch.cat(outputs, dim=-1)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class DFASTransformerBlock(nn.Module):
+    def __init__(self, config, num_spans=4):
+        super().__init__()
+        self.attn = DFASMultiHeadAttention(config, num_spans)
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln_1(x), mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -124,6 +163,7 @@ class GPTConfig:
     aux_task_weight: float = 0.1  # Initial weight for the auxiliary task loss
     aux_task_decay: float = 1.5  # Decay rate for auxiliary task weight
     max_iters: int = 600000  # Maximum number of iterations
+    num_spans: int = 4
 
 
 class GPT(nn.Module):
@@ -138,7 +178,7 @@ class GPT(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             wpe=nn.Embedding(config.block_size, config.n_embd),
             drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h=nn.ModuleList([DFASTransformerBlock(config) for _ in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)

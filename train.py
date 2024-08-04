@@ -156,10 +156,10 @@ if os.path.exists(meta_path):
 # model init
 aux_task_weight = 0.1
 aux_task_decay = 1.5
-num_spans = 7
+# num_spans = 4
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, aux_task_weight=aux_task_weight,
-                  aux_task_decay=aux_task_decay, max_iters=max_iters, num_spans=num_spans)
+                  aux_task_decay=aux_task_decay, max_iters=max_iters)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
